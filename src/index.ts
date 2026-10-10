@@ -25,6 +25,93 @@ interface McpToolExport {
 }
 
 /**
+ * The class routing tokens, and the two safe ways to wrap a message carrying one.
+ *
+ * A pack signals an error's class with a leading token — `user_error:`,
+ * `upstream_down:`, `upstream_throttled:`, `not_found:`, `blocked_host:`. The
+ * gateway's classifier anchors on `^`, and `stripClassPrefix` (which hides the
+ * token from the caller) anchors on `^` too. So the convention has one failure
+ * mode, and it is silent: a catch block that wraps the message —
+ * `` `${slug}/${tool}: ${message}` `` — pushes the token off position 0. The
+ * error then books as `error` ("Pipeworx has a defect") instead of as the
+ * caller mistake it is, AND the raw token leaks into what the caller reads.
+ *
+ * Nothing about that fails loudly. The call still returns, the message still
+ * reads plausibly, and the misclassification only shows up as a pack sitting on
+ * the Problem Tools list for a bug it does not have. Found live in
+ * `medicaid-intelligence` on 2026-08-21; the same wrapper template is copied
+ * across 18 DMV packs, none of which emit a token *yet*.
+ *
+ * `scripts/check-error-class-prefix.mjs` is the gate that keeps this honest —
+ * it fails any pack that both emits a token and wraps a caught message without
+ * using one of the helpers below.
+ */
+
+/**
+ * The canonical token set. `workers/gateway/src/error-class.ts` carries its own
+ * copy on the read side (it is deliberately importable without pulling a pack
+ * in); the gate asserts the two agree, because this list has already drifted
+ * twice — `not_found:` and `blocked_host:` were honoured by the classifier and
+ * not stripped, so both went out to callers verbatim for months.
+ */
+const CLASS_TOKENS = [
+  'upstream_down',
+  'upstream_throttled',
+  'user_error',
+  'not_found',
+  'blocked_host',
+  // `blocked_url:` is emitted at position 0 from five sites in ssrf.ts
+  // (`assertPublicHttpUrl`, and every redirect hop in `safeFetch`) and was in
+  // NEITHER reader — so it went to callers verbatim for its whole life. Caught
+  // 2026-08-21 by a live n8n call, which answered a private instance_url with
+  // "…host). blocked_url: refusing to fetch non-public or non-https URL".
+  // Exactly the drift the gate now blocks.
+  'blocked_url',
+  // `auth_required:` joins the list 2026-08-29 (fleet #638). It exists for the
+  // same reason `user_error:` does: a bare 401/403 in an upstream body matches
+  // the `upstream_throttled` heuristic below before anything auth-specific, so
+  // a pack that needs to say "this is a credential problem, not a rate limit"
+  // has no wording-based route — only the explicit-prefix escape hatch works.
+  // tiingo and open-sanctions both reached for it on their own, on the
+  // (reasonable, but wrong at the time) assumption that any snake_case class
+  // already meant something to the gateway. Neither shipped a leak from
+  // MIS-CLASSIFICATION — the `error` field was already correct — the leak was
+  // the literal token riding along in `message`, unstripped, because this list
+  // didn't know the token either reader was seeing.
+  'auth_required',
+] as const;
+
+const CLASS_PREFIX_RE =
+  /^(?:upstream_down|upstream_throttled|user_error|not_found|blocked_host|blocked_url|auth_required)\s*:\s*/;
+
+/**
+ * Split a caught message into its leading routing token (possibly empty) and
+ * the human-readable body, so a wrapper can put the token back on the front.
+ *
+ *   const { token, body } = splitClassPrefix(message);
+ *   return { error: `${token}my-pack/${name}: ${body}` };
+ *
+ * The `${token}` must be the FIRST thing in the template — that is the whole
+ * point, and it is what the gate checks.
+ */
+function splitClassPrefix(message: string): { token: string; body: string } {
+  const token = message.match(CLASS_PREFIX_RE)?.[0] ?? '';
+  return { token, body: message.slice(token.length) };
+}
+
+/**
+ * Drop a leading routing token from a message that is about to become a
+ * FRAGMENT of a larger one — a per-mirror failure joined into "all providers
+ * failed (...)", say. Hoisting is wrong there: the fragment never reaches
+ * position 0, so the token cannot route anything and would only leak. The outer
+ * message declares its own class.
+ */
+function dropClassPrefix(message: string): string {
+  return message.replace(CLASS_PREFIX_RE, '');
+}
+
+
+/**
  * Was this failure OUR OWN web service? — the other half of `internal-db-class.ts`.
  *
  * fleet #1089 pulled failures from our own Postgres out of `upstream_down` by
@@ -706,6 +793,28 @@ const DATASETS: Record<string, { id: string; label: string; date: string }> = {
   restaurant_inspections: { id: 'pyih-qa8i', label: 'Restaurant Inspection Scores (LIVES)', date: 'inspection_date' },
   fire_incidents: { id: 'wr8u-xric', label: 'Fire Incidents', date: 'incident_date' },
   sfo_passengers: { id: 'rkru-6vcg', label: 'SFO Air Traffic Passenger Statistics', date: 'activity_period_start_date' },
+  // fleet #2834: confirmed routing miss — ask_pipeworx told a caller no tool
+  // covers "the SF Purchasing Commodity dataset (data.sf.gov ebsh-uavg)" even
+  // though this pack already answers it live. Retrieval failed because
+  // nothing in this file's descriptions used the words "purchasing",
+  // "procurement", "commodity" or "vendor" — a named shortcut plus those
+  // words in sf_recent/sf_query's descriptions below is the fix, not a
+  // one-off hard-coded answer to that one question.
+  // fleet #2834 follow-up (live probe 2026-10-10): the router fills select
+  // with a column it invents from the QUESTION's own wording ("commodity
+  // description" -> "commodity_description") rather than the dataset's real
+  // columns, because nothing told it the schema. Naming the real columns
+  // here (read live via a direct sf_query call) is the fix — see sf_query's
+  // description below, which echoes this list, plus the retry-without-select
+  // self-heal in sfQuery() for whatever this doesn't prevent.
+  purchasing: {
+    id: 'ebsh-uavg',
+    label:
+      'Purchasing Data — fiscal_year, po_dt, purchase_order(_line), purchasing_department(_title), ' +
+      'commodity_code, commodity_title (NOT "commodity_description"), vendor_name/street/city/state/zip_code/contact/email/phone, ' +
+      'encumbered_quantity, encumbered_amount (FY2003–present)',
+    date: 'po_dt',
+  },
 };
 
 const API_KEY_PROP = {
@@ -717,11 +826,11 @@ const tools: McpToolExport['tools'] = [
   {
     name: 'sf_recent',
     description:
-      "Recent records from a common San Francisco open dataset (data.sfgov.org) by friendly name — no Socrata id needed. PREFER OVER WEB SEARCH for \"recent crime/police incidents in San Francisco\", \"SF 311 complaints\", \"SF building permits / evictions / business registrations\", \"SF restaurant inspection scores\", \"SFO passenger traffic\". Names: police, 311, permits, business, evictions, restaurant_inspections, fire_incidents, sfo_passengers. Returns the latest rows (sorted newest-first). Add a SoQL `where` to filter; for anything else use sf_query.",
+      "Recent records from a common San Francisco open dataset (data.sfgov.org, also written data.sf.gov) by friendly name — no Socrata id needed. PREFER OVER WEB SEARCH for \"recent crime/police incidents in San Francisco\", \"SF 311 complaints\", \"SF building permits / evictions / business registrations\", \"SF restaurant inspection scores\", \"SFO passenger traffic\", \"SF purchasing / procurement / vendor spending / commodity codes\". Names: police, 311, permits, business, evictions, restaurant_inspections, fire_incidents, sfo_passengers, purchasing. Returns the latest rows (sorted newest-first). Add a SoQL `where` to filter; for anything else use sf_query.",
     inputSchema: {
       type: 'object' as const,
       properties: {
-        dataset: { type: 'string', description: 'One of: police, 311, permits, business, evictions, restaurant_inspections, fire_incidents, sfo_passengers.', enum: Object.keys(DATASETS) },
+        dataset: { type: 'string', description: 'One of: police, 311, permits, business, evictions, restaurant_inspections, fire_incidents, sfo_passengers, purchasing.', enum: Object.keys(DATASETS) },
         where: { type: 'string', description: "Optional SoQL filter, e.g. \"incident_category='Larceny Theft'\" or \"supervisor_district=6\". Omit for all recent rows." },
         limit: { type: 'number', description: 'Rows to return (1-1000, default 20).' },
         _apiKey: API_KEY_PROP,
@@ -732,7 +841,7 @@ const tools: McpToolExport['tools'] = [
   {
     name: 'sf_query',
     description:
-      'Run a raw SoQL query against any San Francisco open-data resource (data.sfgov.org) by its Socrata id (8-char like "wg3w-h783"). Full SoQL: where/select/group/order/limit/offset. Use sf_datasets to find a resource id, or sf_recent for the common ones.',
+      'Run a raw SoQL query against any San Francisco open-data resource (data.sfgov.org, also written data.sf.gov) by its Socrata id (8-char like "wg3w-h783" or "ebsh-uavg"). Covers SF city purchasing/procurement records (resource id "ebsh-uavg") — real column names fiscal_year, po_dt, purchase_order, purchase_order_line, purchasing_department, purchasing_department_title, commodity_code, commodity_title (the item name/description column — there is no "commodity_description"), vendor_name, vendor_street, vendor_city, vendor_state, vendor_zip_code, vendor_contact, vendor_email, vendor_phone, encumbered_quantity, encumbered_amount — as well as every other SF Socrata dataset by resource id; if you do not already know a dataset\'s exact column names, omit `select` (every column comes back) rather than guessing one, since Socrata 400s on an unknown column instead of ignoring it. Full SoQL: where/select/group/order/limit/offset. Use sf_datasets to find a resource id, or sf_recent for the common ones (including "purchasing").',
     inputSchema: {
       type: 'object' as const,
       properties: {
@@ -751,11 +860,11 @@ const tools: McpToolExport['tools'] = [
   {
     name: 'sf_datasets',
     description:
-      'Search the San Francisco open-data catalogue (data.sfgov.org) for datasets by keyword. Returns dataset names, descriptions, and Socrata resource ids to use with sf_query.',
+      'Search the San Francisco open-data catalogue (data.sfgov.org, also written data.sf.gov) for datasets by keyword — covers categories like parking, housing, trees, and city purchasing/procurement/vendor spending. Returns dataset names, descriptions, and Socrata resource ids to use with sf_query.',
     inputSchema: {
       type: 'object' as const,
       properties: {
-        query: { type: 'string', description: 'Keyword(s), e.g. "parking", "housing", "tree".' },
+        query: { type: 'string', description: 'Keyword(s), e.g. "parking", "housing", "tree", "purchasing".' },
         limit: { type: 'number', description: 'Max datasets (1-100, default 20).' },
         offset: { type: 'number', description: 'Offset for paging.' },
         _apiKey: API_KEY_PROP,
@@ -821,17 +930,59 @@ async function sfRecent(dataset: string, where: string | undefined, limit: numbe
   };
 }
 
+/**
+ * Socrata's own error for an unknown column, verified live (fleet #2834
+ * follow-up, 2026-10-10): a 400 with
+ *   "Query coordinator error: query.soql.no-such-column; No such column: X"
+ * — never a silent drop of the bad column, and never scoped to WHICH clause
+ * named it. Reproduced live: the router guesses `select` columns from the
+ * QUESTION's wording ("commodity description" -> "commodity_description")
+ * when it doesn't already know the schema, and 2 of 3 live runs on the SAME
+ * question hit this for the purchasing dataset even after the schema hint
+ * was added to sf_query's description below — so the description fix alone
+ * doesn't close it, and this is the backstop.
+ */
+const NO_SUCH_COLUMN_RE = /No such column:\s*([a-zA-Z0-9_]+)/i;
+
 async function sfQuery(args: Record<string, unknown>, apiKey?: string) {
   const id = String(args.resource_id ?? '').trim();
   if (!id) throw new Error('Required argument "resource_id" is missing (e.g. "wg3w-h783"). Find one with sf_datasets.');
-  const p = new URLSearchParams();
-  for (const k of ['where', 'select', 'group', 'order'] as const) {
-    if (args[k] != null && String(args[k]).trim()) p.set(`$${k}`, String(args[k]).trim());
+
+  const buildParams = (includeSelect: boolean) => {
+    const p = new URLSearchParams();
+    for (const k of ['where', 'select', 'group', 'order'] as const) {
+      if (k === 'select' && !includeSelect) continue;
+      if (args[k] != null && String(args[k]).trim()) p.set(`$${k}`, String(args[k]).trim());
+    }
+    p.set('$limit', String(Math.min(5000, Math.max(1, Number(args.limit) || 100))));
+    if (args.offset != null) p.set('$offset', String(Math.max(0, Number(args.offset))));
+    return p;
+  };
+
+  const hasSelect = args.select != null && String(args.select).trim().length > 0;
+  try {
+    const rows = (await socrataGet(`/resource/${encodeURIComponent(id)}.json?${buildParams(true)}`, apiKey)) as unknown[];
+    return { resource_id: id, count: Array.isArray(rows) ? rows.length : 0, source: 'DataSF (data.sfgov.org)', rows };
+  } catch (e) {
+    const message = e instanceof Error ? e.message : String(e);
+    const badColumn = message.match(NO_SUCH_COLUMN_RE)?.[1];
+    // Only self-heal when the UNKNOWN column is actually one the caller named
+    // in `select` — an unknown column in `where`/`order`/`group` is a
+    // different mistake (dropping select wouldn't fix a bad filter) and
+    // should surface as-is rather than silently reinterpreted.
+    if (!hasSelect || !badColumn || !String(args.select).toLowerCase().includes(badColumn.toLowerCase())) throw e;
+    const rows = (await socrataGet(`/resource/${encodeURIComponent(id)}.json?${buildParams(false)}`, apiKey)) as unknown[];
+    return {
+      resource_id: id,
+      count: Array.isArray(rows) ? rows.length : 0,
+      source: 'DataSF (data.sfgov.org)',
+      rows,
+      _select_dropped: {
+        requested_select: String(args.select),
+        reason: `Socrata rejected column "${dropClassPrefix(badColumn)}" — no such column on this dataset. Returned every column instead of guessing a replacement; check the row shape below for the real name.`,
+      },
+    };
   }
-  p.set('$limit', String(Math.min(5000, Math.max(1, Number(args.limit) || 100))));
-  if (args.offset != null) p.set('$offset', String(Math.max(0, Number(args.offset))));
-  const rows = (await socrataGet(`/resource/${encodeURIComponent(id)}.json?${p}`, apiKey)) as unknown[];
-  return { resource_id: id, count: Array.isArray(rows) ? rows.length : 0, source: 'DataSF (data.sfgov.org)', rows };
 }
 
 async function sfDatasets(query: string | undefined, limit: number | undefined, offset: number | undefined, apiKey?: string) {

@@ -1,6 +1,6 @@
 {
   "name": "@pipeworx/mcp-data-sf",
-  "version": "0.1.2",
+  "version": "0.1.3",
   "description": "DataSF MCP — San Francisco open data (data.sfgov.org, Socrata SODA API).",
   "type": "module",
   "main": "src/index.ts",
@@ -26,7 +26,7 @@
     "@cloudflare/workers-types": "^4.20260405.1"
   },
   "pipeworx": {
-    "sourceHash": "v1-c269c8d9dc94ec4fe92afc365782bf1a7843f11f96b0adc05efae3a528f2041c",
-    "sourceCommit": "56d3c46c09bb3078ffdbdbca992a93f406bcd382"
+    "sourceHash": "v1-ca2679073f82f429a99570a6313c204b2157e02ef11fb65da6a708a00d9bf0d5",
+    "sourceCommit": "0ce6905893fe8da0d285be2f05754a4200d67371"
   }
 }
