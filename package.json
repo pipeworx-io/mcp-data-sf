@@ -1,12 +1,20 @@
 {
   "name": "@pipeworx/mcp-data-sf",
-  "version": "0.1.6",
+  "version": "0.2.0",
   "description": "DataSF MCP — San Francisco open data (data.sfgov.org, Socrata SODA API).",
   "type": "module",
-  "main": "src/index.ts",
-  "types": "src/index.ts",
+  "main": "lib/index.js",
+  "exports": {
+    ".": "./lib/index.js",
+    "./tools.json": "./tools.json",
+    "./package.json": "./package.json"
+  },
   "bin": {
     "mcp-data-sf": "bin/cli.js"
+  },
+  "files": ["bin/", "lib/", "tools.json", "server.json"],
+  "engines": {
+    "node": ">=18"
   },
   "keywords": ["mcp", "mcp-server", "model-context-protocol", "pipeworx", "data-sf"],
   "license": "MIT",
@@ -14,19 +22,12 @@
     "type": "git",
     "url": "git+https://github.com/pipeworx-io/mcp-data-sf.git"
   },
-  "scripts": {
-    "typecheck": "tsc --noEmit"
-  },
-  "dependencies": {
-    "@modelcontextprotocol/sdk": "^1.30.0",
-    "tsx": "^4.19.0"
-  },
-  "devDependencies": {
-    "typescript": "^5.9.3",
-    "@cloudflare/workers-types": "^4.20260405.1"
-  },
+  "mcpName": "io.github.pipeworx-io/data-sf",
   "pipeworx": {
-    "sourceHash": "v1-4fe3135ed81b1bb381ce3cf80c30d1b1b62e56eb774aef80ecebb0f32f2bcde5",
-    "sourceCommit": "ba9dd6df5992aeb16ef2425ee86d1752c34ca636"
+    "mode": "gateway",
+    "slug": "data-sf",
+    "gatewaySlug": "data-sf",
+    "sourceHash": "v1-5cb434430395caf48032daefff7da48388a0de8ffe84f38a1c88e3c9e76933d3",
+    "sourceCommit": "0b3faaa4d85299a961dd86dea75a0f0e1dad280c"
   }
 }
